@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SmartTalk</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      @keyframes gradientShift {
+        0% { background-position: 0% 50%; }
+        25% { background-position: 100% 50%; }
+        50% { background-position: 100% 100%; }
+        75% { background-position: 0% 100%; }
+        100% { background-position: 0% 50%; }
+      }
+      .dark-dynamic-bg {
+        background: linear-gradient(-45deg, #0f0c29, #1a1a2e, #16213e, #0f3460, #1a1a2e, #0f0c29);
+        background-size: 400% 400%;
+        animation: gradientShift 15s ease infinite;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>
