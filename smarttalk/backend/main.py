@@ -4,31 +4,49 @@ from pydantic import BaseModel
 from typing import Optional, Dict, List, Any
 import asyncio
 import json
-import os
 import re
 import time
 import threading
 import multiprocessing
 from pathlib import Path
 from datetime import datetime
+import os
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
 # ---------- CONFIG ----------
-load_dotenv()
-API_KEY = os.environ.get("GOOGLE_API_KEY")
+load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
+API_KEY = os.environ.get("GOOGLE_API_KEY")
 if not API_KEY:
     raise ValueError("GOOGLE_API_KEY not set!")
 
 client = genai.Client(api_key=API_KEY)
+GEMINI_MODEL = "gemini-2.0-flash"
+
+def gemini_generate(prompt: str, json_mode: bool = False) -> str:
+    """Synchronous Gemini generation."""
+    config = types.GenerateContentConfig(response_mime_type="application/json") if json_mode else None
+    response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt, config=config)
+    return response.text
+
+async def gemini_generate_async(prompt: str) -> str:
+    """Async Gemini generation."""
+    response = await client.aio.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(response_mime_type="application/json"),
+    )
+    return response.text
+
 PROBLEM_POOL_FILE = Path("problem_pool.json")
 POOL_SIZE = 20
 TARGET_PER_DIFFICULTY = POOL_SIZE // 4
 MAX_WORKERS = 8
 MAX_GENERATION_RETRIES = 3
 CODE_EXECUTION_TIMEOUT = 5  # seconds
+PARALLEL_GENERATION = os.environ.get("PARALLEL_GENERATION", "true").lower() == "true"
 
 # ---------- FastAPI App ----------
 app = FastAPI(title="SmartTalk API")
@@ -220,29 +238,19 @@ Return a JSON object with these exact keys:
     for attempt in range(MAX_GENERATION_RETRIES):
         try:
             start_time = time.time()
-            response = client.models.generate_content(
-                model="gemini-3-pro-preview",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema={
-                        "type": "OBJECT",
-                        "properties": {
-                            "problem": {"type": "STRING"},
-                            "func_signature": {"type": "STRING"},
-                            "class_definitions": {"type": "STRING"},
-                        },
-                        "required": ["problem", "func_signature"],
-                    },
-                ),
-            )
+            raw = gemini_generate(prompt)
             elapsed = time.time() - start_time
 
-            data = json.loads(response.text)
+            # Extract JSON from response
+            json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+            if not json_match:
+                print(f"Attempt {attempt+1}: No JSON found for {difficulty}")
+                continue
+            data = json.loads(json_match.group())
 
             # Validate required fields
             if not data.get("problem") or not data.get("func_signature"):
-                print(f"Attempt {attempt+1}: Empty required fields for {difficulty}")
+                print(f"Attempt {attempt+1}: Empty required fields for {difficulty}. Keys: {list(data.keys())}")
                 continue
 
             data["func_signature"] = enforce_good_signature(
@@ -259,7 +267,7 @@ Return a JSON object with these exact keys:
             print(f"Attempt {attempt+1}: JSON parse error for {difficulty}: {e}")
             continue
         except Exception as e:
-            print(f"Attempt {attempt+1}: Error generating {difficulty}: {e}")
+            print(f"Attempt {attempt+1}: Error generating {difficulty}: {type(e).__name__}: {e}")
             if attempt < MAX_GENERATION_RETRIES - 1:
                 time.sleep(1 * (attempt + 1))  # backoff
             continue
@@ -306,28 +314,18 @@ Return a JSON object with these exact keys:
     for attempt in range(MAX_GENERATION_RETRIES):
         try:
             start_time = time.time()
-            response = await client.aio.models.generate_content(
-                model="gemini-3-pro-preview",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema={
-                        "type": "OBJECT",
-                        "properties": {
-                            "problem": {"type": "STRING"},
-                            "func_signature": {"type": "STRING"},
-                            "class_definitions": {"type": "STRING"},
-                        },
-                        "required": ["problem", "func_signature"],
-                    },
-                ),
-            )
+            raw = await gemini_generate_async(prompt)
             elapsed = time.time() - start_time
 
-            data = json.loads(response.text)
+            # Extract JSON from response
+            json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+            if not json_match:
+                print(f"Attempt {attempt+1}: No JSON found for {difficulty}")
+                continue
+            data = json.loads(json_match.group())
 
             if not data.get("problem") or not data.get("func_signature"):
-                print(f"Attempt {attempt+1}: Empty required fields for {difficulty}")
+                print(f"Attempt {attempt+1}: Empty required fields for {difficulty}. Keys: {list(data.keys())}")
                 continue
 
             data["func_signature"] = enforce_good_signature(
@@ -344,7 +342,7 @@ Return a JSON object with these exact keys:
             print(f"Attempt {attempt+1}: JSON parse error for {difficulty}: {e}")
             continue
         except Exception as e:
-            print(f"Attempt {attempt+1}: Error generating {difficulty}: {e}")
+            print(f"Attempt {attempt+1}: Error generating {difficulty}: {type(e).__name__}: {e}")
             if attempt < MAX_GENERATION_RETRIES - 1:
                 await asyncio.sleep(1 * (attempt + 1))
             continue
@@ -352,34 +350,110 @@ Return a JSON object with these exact keys:
     print(f"All {MAX_GENERATION_RETRIES} attempts failed for {difficulty}")
     return None
 
+BATCH_PROMPT = """Generate one coding interview problem for each of the following difficulties: Easy, Medium, Hard, Expert.
+
+For each problem include:
+1. Problem description (clear and concise)
+2. Input format
+3. Output format
+4. 2-3 examples with input/output and explanation
+5. Constraints
+6. Python function signature with type hints
+
+IMPORTANT FORMATTING RULES for each "problem" field:
+- Use standard markdown formatting
+- Use code blocks with backticks for code: `code here`
+- Use **bold** for emphasis
+- ALL math expressions and constraints MUST be wrapped in dollar signs for LaTeX rendering
+- Use $\\leq$ for <=, $\\geq$ for >=, $\\times$ for multiplication
+- NEVER write raw LaTeX without dollar signs
+
+Rules for func_signature:
+- Must be a valid Python function signature like: def function_name(params: Type) -> ReturnType:
+- No imports needed (typing symbols like List, Dict, Optional exist)
+- Function name should be descriptive
+
+Keep each description under 300 words.
+
+Return a JSON object with exactly these keys: "Easy", "Medium", "Hard", "Expert".
+Each value is an object with keys: "problem" (string), "func_signature" (string), "class_definitions" (string or empty string)."""
+
+async def generate_batch_async() -> Dict[str, Optional[Dict]]:
+    """Generate one problem per difficulty in a single Gemini call."""
+    for attempt in range(MAX_GENERATION_RETRIES):
+        try:
+            start_time = time.time()
+            raw = await gemini_generate_async(BATCH_PROMPT)
+            elapsed = time.time() - start_time
+
+            json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+            if not json_match:
+                print(f"Batch attempt {attempt+1}: No JSON found")
+                continue
+
+            data = json.loads(json_match.group())
+            results = {}
+            for diff in ["Easy", "Medium", "Hard", "Expert"]:
+                entry = data.get(diff)
+                if not entry or not entry.get("problem") or not entry.get("func_signature"):
+                    print(f"Batch attempt {attempt+1}: Missing or empty fields for {diff}")
+                    continue
+                entry["func_signature"] = enforce_good_signature(
+                    entry.get("func_signature", ""),
+                    fallback="def solve(nums: List[int]) -> int:"
+                )
+                entry["class_definitions"] = entry.get("class_definitions", "")
+                entry["difficulty"] = diff
+                entry["generation_time"] = elapsed
+                results[diff] = entry
+            return results
+
+        except json.JSONDecodeError as e:
+            print(f"Batch attempt {attempt+1}: JSON parse error: {e}")
+        except Exception as e:
+            print(f"Batch attempt {attempt+1}: Error: {type(e).__name__}: {e}")
+            if attempt < MAX_GENERATION_RETRIES - 1:
+                await asyncio.sleep(1 * (attempt + 1))
+
+    return {}
+
 async def fill_pool_async():
     with file_lock:
         pool = load_problem_pool()
 
-    tasks = []
-    for diff in ["Easy", "Medium", "Hard", "Expert"]:
-        needed = TARGET_PER_DIFFICULTY - len(pool.get(diff, []))
-        tasks.extend([diff] * max(0, needed))
-
-    if not tasks:
+    needed = {diff: TARGET_PER_DIFFICULTY - len(pool.get(diff, [])) for diff in ["Easy", "Medium", "Hard", "Expert"]}
+    total_needed = sum(needed.values())
+    if total_needed == 0:
         return 0
 
-    print(f"Generating {len(tasks)} problems fully in parallel...")
+    num_batches = max(needed.values())
+    mode = "parallel" if PARALLEL_GENERATION else "sequential"
+    print(f"Generating {total_needed} problems via {num_batches} {mode} batch calls...")
     start_time = time.time()
 
-    async def gen_and_add(diff: str) -> int:
-        problem = await generate_one_problem_async(diff)
-        if problem:
+    async def run_batch_and_add() -> int:
+        results = await generate_batch_async()
+        added = 0
+        for diff, problem in results.items():
+            if needed.get(diff, 0) <= 0:
+                continue
             problem["generated_at"] = datetime.now().isoformat()
+            problem["generated_by"] = GEMINI_MODEL
             if atomic_add_problem(diff, problem):
+                needed[diff] -= 1
                 with file_lock:
                     count = len(load_problem_pool().get(diff, []))
                 print(f"{diff}: {count}/{TARGET_PER_DIFFICULTY}")
-                return 1
-        return 0
+                added += 1
+        return added
 
-    results = await asyncio.gather(*[gen_and_add(d) for d in tasks], return_exceptions=True)
-    generated = sum(r for r in results if isinstance(r, int))
+    if PARALLEL_GENERATION:
+        results = await asyncio.gather(*[run_batch_and_add() for _ in range(num_batches)], return_exceptions=True)
+        generated = sum(r for r in results if isinstance(r, int))
+    else:
+        generated = 0
+        for _ in range(num_batches):
+            generated += await run_batch_and_add()
 
     elapsed = time.time() - start_time
     print(f"Batch complete: {generated} problems in {elapsed:.1f}s")
@@ -392,25 +466,28 @@ async def background_generator_async():
         with file_lock:
             pool = load_problem_pool()
 
-        tasks = []
-        for diff in ["Easy", "Medium", "Hard", "Expert"]:
-            needed = TARGET_PER_DIFFICULTY - len(pool.get(diff, []))
-            tasks.extend([diff] * max(0, needed))
-
-        if not tasks:
+        needed = {diff: TARGET_PER_DIFFICULTY - len(pool.get(diff, [])) for diff in ["Easy", "Medium", "Hard", "Expert"]}
+        if sum(needed.values()) == 0:
             await asyncio.sleep(60)
             continue
 
-        print(f"Background: generating {len(tasks)} problems in parallel...")
+        num_batches = max(needed.values())
+        mode = "parallel" if PARALLEL_GENERATION else "sequential"
+        print(f"Background: generating via {num_batches} {mode} batch calls...")
 
-        async def gen_and_add(diff: str):
-            problem = await generate_one_problem_async(diff)
-            if problem:
+        async def run_batch_and_add_bg() -> None:
+            results = await generate_batch_async()
+            for diff, problem in results.items():
                 problem["generated_at"] = datetime.now().isoformat()
+                problem["generated_by"] = GEMINI_MODEL
                 atomic_add_problem(diff, problem)
 
-        await asyncio.gather(*[gen_and_add(d) for d in tasks], return_exceptions=True)
-        await asyncio.sleep(3)
+        if PARALLEL_GENERATION:
+            await asyncio.gather(*[run_batch_and_add_bg() for _ in range(num_batches)], return_exceptions=True)
+        else:
+            for _ in range(num_batches):
+                await run_batch_and_add_bg()
+        await asyncio.sleep(30)
 
 # ---------- Sandboxed Code Execution ----------
 def _run_code_in_process(code: str, func_name: str, test_input_str: str, expected_str: str, conn):
@@ -562,12 +639,7 @@ SCORE: [number]
 FEEDBACK: [your feedback with markdown formatting]"""
 
     try:
-        response = client.models.generate_content(
-            model="gemini-3-pro-preview",
-            contents=ai_prompt
-        )
-
-        response_text = fix_markdown_formatting(response.text)
+        response_text = fix_markdown_formatting(gemini_generate(ai_prompt))
 
         score_match = re.search(r'SCORE:\s*(\d+)', response_text)
         score = int(score_match.group(1)) if score_match else 5
@@ -629,12 +701,7 @@ Format your response EXACTLY as:
 - Space: O(1)"""
 
     try:
-        response = client.models.generate_content(
-            model="gemini-3-pro-preview",
-            contents=ai_prompt
-        )
-
-        response_text = fix_markdown_formatting(response.text)
+        response_text = fix_markdown_formatting(gemini_generate(ai_prompt))
 
         return {
             "score": 0,
