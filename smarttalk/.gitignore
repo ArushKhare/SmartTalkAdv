@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 .env
 problem_pool.json
+backend/.env
